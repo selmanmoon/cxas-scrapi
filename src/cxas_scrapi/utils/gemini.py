@@ -167,6 +167,7 @@ class GeminiGenerate:
 
         contents = self._build_contents(prompt, audio_path, audio_bytes)
 
+        self._thread_local.last_error = None
         try:
             response = self.client.models.generate_content(
                 model=target_model, contents=contents, config=config
@@ -175,9 +176,20 @@ class GeminiGenerate:
             if response_mime_type == "application/json" and response_schema:
                 return response.parsed
             return response.text
-        except Exception:
+        except Exception as exc:
             logger.exception("Gemini generation failed")
+            self._thread_local.last_error = exc
             return None
+
+    @property
+    def last_error(self) -> BaseException | None:
+        """The exception behind this thread's last failed `generate` call.
+
+        `generate` returns None on failure so callers keep working; this
+        lets callers that need to report why (e.g. simulation harness
+        errors) recover the cause. Reset at the start of every call.
+        """
+        return getattr(self._thread_local, "last_error", None)
 
     def generate_with_parts(
         self,

@@ -5,7 +5,11 @@
 </h1>
 <div class="summary">
   <div class="summary-top">
-    <div class="big {{ 'pass' if pct >= 90 else 'fail' }}">{{ "%.0f" | format(pct) }}%</div>
+    {% if total == 0 and s_harness %}
+      <div class="big harness">n/a</div>
+    {% else %}
+      <div class="big {{ 'pass' if pct >= 90 else 'fail' }}">{{ "%.0f" | format(pct) }}%</div>
+    {% endif %}
     <div><b>{{ passed }}/{{ total }}</b> total passed<br><span class="meta">Generated {{ ts }}</span></div>
   </div>
   <div class="summary-grid">
@@ -21,11 +25,14 @@
     {% endif %}
 
     {% if sim_results %}
-      {% set s_cls = "pass" if s_passed == s_total else "fail" %}
+      {% set s_cls = "harness" if s_total == 0 else ("pass" if s_passed == s_total else "fail") %}
       {% set s_time = "" %}
       <div class="summary-card" onclick="document.getElementById('section-sims').scrollIntoView({behavior:'smooth'})" style="cursor:pointer">
         <div class="label">Sims ({{ sim_modality }})</div>
         <div class="value {{ s_cls }}">{{ s_passed }}/{{ s_total }}</div>
+        {% if s_harness %}
+          <div class="harness" style="font-size:0.85em;margin-top:4px;">+{{ s_harness }} harness error{{ "s" if s_harness > 1 else "" }} (inconclusive)</div>
+        {% endif %}
         {% if sim_wall_clock_s %}
           <br><span class='meta'>{{ _fmt_duration(sim_wall_clock_s) }}</span>
         {% elif s_dur > 0 %}
@@ -82,7 +89,11 @@
 
     <tr class="clickable" data-passed="{{ passed_str }}" onclick="jumpTo('{{ u['type'] }}', '{{ safe_name }}')">
       <td>
-        {% if u["type"] == "sim" and "run_results" in u %}
+        {% if u["type"] == "sim" and u.get("sim_label") %}
+          {% set sim_cls = {"PASSED": "pass", "FAILED": "fail", "MIXED": "mixed", "INCONCLUSIVE": "harness"}[u["sim_label"]] %}
+          <span class="{{ sim_cls }}"><b>{{ u["sim_label"] }}</b></span>
+          {% if u["sim_label"] == "MIXED" %}<span class="meta">{{ u["score"] }}</span>{% endif %}
+        {% elif u["type"] == "sim" and "run_results" in u %}
           {% set p = u["run_results"] | selectattr('passed') | list | length %}
           {% set t = u["run_results"] | length %}
           {% if p == t %}
@@ -103,9 +114,10 @@
       <td>
         {% if u["type"] == "sim" and "run_results" in u %}
           {% for r in u["run_results"] %}
-            {% set dot_cls = "p" if r.get("passed") else "f" %}
-            <span class="run-dot {{ dot_cls }}" title="Run {{ r.get('run','?') }}" onclick="event.stopPropagation(); jumpToRun('{{ u['type'] }}', '{{ safe_name }}', {{ loop.index0 }})"></span>
+            {% set dot_cls = {"pass": "p", "fail": "f", "harness": "h"}[sim_run_status(r)[0]] %}
+            <span class="run-dot {{ dot_cls }}" title="Run {{ r.get('run','?') }}{% if dot_cls == 'h' %} (harness error){% endif %}" onclick="event.stopPropagation(); jumpToRun('{{ u['type'] }}', '{{ safe_name }}', {{ loop.index0 }})"></span>
           {% endfor %}
+          {% if u.get("harness_errors") %}<span class="meta harness">{{ u["harness_errors"] }} harness error{{ "s" if u["harness_errors"] > 1 else "" }}</span>{% endif %}
         {% else %}
           {{ u["detail"] | escape }}
         {% endif %}
@@ -113,6 +125,10 @@
     </tr>
   {% endfor %}
 </table>
+
+{% if sim_reliability_html %}
+  {{ sim_reliability_html | safe }}
+{% endif %}
 
 {% if failure_patterns_html %}
   {{ failure_patterns_html | safe }}
@@ -258,8 +274,8 @@
 {% endif %}
 
 {% if sim_results %}
-  {% set s_pct_str = "%.0f%%" | format(100 * s_passed / s_total) if s_total else "0%" %}
-  <h2 id="section-sims">Simulations <span class="meta">({{ s_passed }}/{{ s_total }} — {{ s_pct_str }})</span></h2>
+  {% set s_pct_str = "%.0f%%" | format(100 * s_passed / s_total) if s_total else ("n/a" if s_harness else "0%") %}
+  <h2 id="section-sims">Simulations <span class="meta">({{ s_passed }}/{{ s_total }} — {{ s_pct_str }}{% if s_harness %}; {{ s_harness }} harness error{{ "s" if s_harness > 1 else "" }} excluded{% endif %})</span></h2>
 
   {# We group simulations by name in template or pass them grouped. Let's assume unified has grouped them for summary, but for detail we can loop over sorted results #}
   {% set grouped_sims = {} %}
@@ -267,7 +283,9 @@
     {% if r.name not in grouped_sims %}
       {% set _ = grouped_sims.update({r.name: {"pass": 0, "total": 0, "runs": []}}) %}
     {% endif %}
-    {% set _ = grouped_sims[r.name].update({"total": grouped_sims[r.name]["total"] + 1}) %}
+    {% if sim_run_status(r)[0] != "harness" %}
+      {% set _ = grouped_sims[r.name].update({"total": grouped_sims[r.name]["total"] + 1}) %}
+    {% endif %}
     {% if r.get("passed") %}
       {% set _ = grouped_sims[r.name].update({"pass": grouped_sims[r.name]["pass"] + 1}) %}
     {% endif %}
@@ -276,8 +294,8 @@
 
   {% for name, s in grouped_sims.items() | sort(attribute='1.pass', reverse=false) %}
     {% set score = s['pass'] ~ '/' ~ s['total'] %}
-    {% set cls = "pass-bg" if s['pass'] == s['total'] else "fail-bg" %}
-    {% set passed_str = "true" if s['pass'] == s['total'] else "false" %}
+    {% set cls = "harness-bg" if s['total'] == 0 else ("pass-bg" if s['pass'] == s['total'] else "fail-bg") %}
+    {% set passed_str = "true" if s['total'] > 0 and s['pass'] == s['total'] else "false" %}
 
     <div class="eval-card" id="eval-sim-{{ name }}" data-passed="{{ passed_str }}">
       <div class="eval-header {{ cls }}">
@@ -286,11 +304,11 @@
       </div>
       <div class="eval-body">
         {% for r in s["runs"] %}
-          {% set run_cls = "pass" if r.get("passed") else "fail" %}
-          {% set failed_str = "false" if r.get("passed") else "true" %}
+          {% set run_cls, run_label = sim_run_status(r) %}
+          {% set failed_str = "true" if run_cls == "fail" else "false" %}
 
           <details class="run-detail" data-failed="{{ failed_str }}">
-            <summary>Run {{ r.get('run','?') }} — <span class="{{ run_cls }}">{% if r.get('passed') %}PASS{% else %}FAIL{% endif %}</span> | goals: {{ r.get('goals','?') }} | expectations: {{ r.get('expectations','?') }} | turns: {{ r.get('turns','?') }}{% if r.get('naturalness') %} | naturalness: {{ r['naturalness'] }}{% endif %}{% if r.get('duration_s') %} | {{ _fmt_duration(r['duration_s']) }}{% endif %}</summary>
+            <summary>Run {{ r.get('run','?') }} — {% if run_cls == "harness" %}<span class="badge harness">Harness error</span>{% else %}<span class="{{ run_cls }}">{{ run_label }}</span>{% endif %} | goals: {{ r.get('goals','?') }} | expectations: {{ r.get('expectations','?') }} | turns: {{ r.get('turns','?') }}{% if r.get('naturalness') %} | naturalness: {{ r['naturalness'] }}{% endif %}{% if r.get('duration_s') %} | {{ _fmt_duration(r['duration_s']) }}{% endif %}</summary>
 
             {% if r.get('session_id') %}
               {% if ces_base %}
@@ -320,6 +338,7 @@
             {% if "error" in r %}
               <div class="expectation"><b>Error:</b> {{ r["error"] | escape }}</div>
             {% else %}
+              {{ render_harness_error(r) | safe }}
               {% for step in r.get('step_details', []) %}
                 {% set s_cls = "pass" if step["status"] == "Completed" else "fail" %}
                 <div class="step">

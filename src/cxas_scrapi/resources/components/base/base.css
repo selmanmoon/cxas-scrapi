@@ -541,6 +541,41 @@ summary {
   background: #e67e22;
 }
 
+/* Harness errors: the simulator failed, not the agent (inconclusive). */
+.run-dot.h {
+  background: #80868b;
+}
+
+.harness {
+  color: #5f6368;
+}
+
+.badge.harness {
+  background: #e8eaed;
+  color: #3c4043;
+}
+
+.eval-header.harness-bg {
+  background: #f1f3f4;
+  border-left: 4px solid #80868b;
+  color: #3c4043;
+}
+
+.harness-error {
+  border-left: 3px solid #80868b;
+  padding-left: 8px;
+}
+
+body.dark-mode .harness {
+  color: #bdc1c6;
+}
+
+body.dark-mode .badge.harness,
+body.dark-mode .eval-header.harness-bg {
+  background: #3c4043;
+  color: #e8eaed;
+}
+
 .session-link {
   font-size: 0.85em;
   color: #3498db;

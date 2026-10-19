@@ -49,6 +49,11 @@ from cxas_scrapi.evals.naturalness import (
     extract_agent_turns,
     parse_naturalness_config,
 )
+from cxas_scrapi.evals.sim_reliability import (
+    SimOutcome,
+    format_simulation_summary,
+    is_harness_error,
+)
 from cxas_scrapi.prompts import llm_user_prompts
 from cxas_scrapi.utils.eval_utils import (
     Conversation as GoldenConversation,
@@ -271,6 +276,8 @@ class LLMUserConversation(Conversation):
         self.expectation_results: list[ExpectationResult] = []
         # Populated only when the optional Naturalness Metric is configured.
         self.naturalness_result: NaturalnessResult | None = None
+        # Set when the simulated user could not produce its next turn.
+        self.harness_error: dict[str, Any] | None = None
 
     def _check_conversation_status(self) -> bool:
         """Checks if the conversation should continue."""
@@ -322,7 +329,8 @@ class LLMUserConversation(Conversation):
         Returns:
           - The generated next user utterance as a string. Returns an empty
             string if the conversation has reached the maximum number of
-            turns or all steps are completed.
+            turns or all steps are completed, or if the simulated user
+            failed to generate a turn (recorded in `harness_error`).
           - The variables to inject as a dict.
         """
         if not self._check_conversation_status():
@@ -352,18 +360,61 @@ class LLMUserConversation(Conversation):
 
         prompt = self._prepare_llm_prompt()
 
-        output: LLMUserConversation.Output = self.genai_client.generate(
-            prompt=prompt,
-            model_name=self.genai_model,
-            response_mime_type="application/json",
-            response_schema=LLMUserConversation.Output,
-        )
+        started = time.monotonic()
+        try:
+            output: LLMUserConversation.Output = self.genai_client.generate(
+                prompt=prompt,
+                model_name=self.genai_model,
+                response_mime_type="application/json",
+                response_schema=LLMUserConversation.Output,
+            )
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            self._record_harness_error(type(e).__name__, str(e), started)
+            return "", {}
 
         if output:
             self.steps_progress = output.step_progresses
             return output.next_user_utterance, {}
 
+        # The generator swallows its own errors and returns None, so an
+        # empty result here means the simulated user could not produce a
+        # turn - not that the conversation reached a natural end.
+        cause = getattr(self.genai_client, "last_error", None)
+        if isinstance(cause, BaseException):
+            self._record_harness_error(
+                type(cause).__name__, str(cause), started
+            )
+        else:
+            self._record_harness_error(
+                "EmptyGeneration",
+                "simulated-user model returned no output",
+                started,
+            )
         return "", {}
+
+    def _record_harness_error(
+        self, error_type: str, message: str, started: float
+    ) -> None:
+        """Records why the simulated user stopped, keeping the first error.
+
+        A harness error makes the run inconclusive: the conversation ends
+        because the simulator failed, so goal progress cannot be trusted.
+        """
+        if self.harness_error is not None:
+            return
+        self.harness_error = {
+            "turn": self.current_turn,
+            "error_type": error_type,
+            "message": message[:500],
+            "elapsed_s": round(time.monotonic() - started, 1),
+        }
+        logger.warning(
+            "Simulated user failed at turn %s (%s: %s); the run will be "
+            "reported as a harness error.",
+            self.current_turn,
+            error_type,
+            message[:200],
+        )
 
     def next_user_utterance(
         self, last_agent_response: str = ""
@@ -822,6 +873,14 @@ class SimulationEvals(Apps):
             )
             if step_prog.justification:
                 print(f"  Justification: {step_prog.justification}")
+        harness_error = getattr(eval_conv, "harness_error", None)
+        if isinstance(harness_error, dict):
+            print(
+                "Harness error: the simulated user stopped at turn "
+                f"{harness_error.get('turn')} "
+                f"({harness_error.get('error_type')}: "
+                f"{harness_error.get('message')}). This run is inconclusive."
+            )
 
     @cleanup_session_dir
     def simulate_conversation(
@@ -1147,14 +1206,36 @@ class SimulationEvals(Apps):
                 if naturalness_result.passed is not None:
                     passed = passed and naturalness_result.passed
 
-            status = "PASS" if passed else "FAIL"
+            # A simulator failure stops the conversation early, so the goal
+            # and expectation verdicts above describe a truncated transcript.
+            # Report the run as inconclusive instead of blaming the agent.
+            harness_error = getattr(conv, "harness_error", None)
+            if not isinstance(harness_error, dict):
+                harness_error = None
+            if harness_error:
+                passed = False
+                outcome = SimOutcome.HARNESS_ERROR
+            else:
+                outcome = SimOutcome.PASS if passed else SimOutcome.FAIL
+
+            status = {
+                SimOutcome.PASS: "PASS",
+                SimOutcome.FAIL: "FAIL",
+                SimOutcome.HARNESS_ERROR: "HARNESS",
+            }[outcome]
+            harness_note = ""
+            if harness_error:
+                harness_note = (
+                    f" | harness error at turn {harness_error.get('turn')}: "
+                    f"{harness_error.get('error_type')}"
+                )
             if parallel > 1 or not verbose:
                 print(
                     f"  {status}  {label} | goals: "
                     f"{goals_completed}/{total_goals} | "
                     f"expectations: {expectations_met}/{total_exp} | "
                     f"turns: {conv.current_turn} | {duration_s}s"
-                    f"{naturalness_note}"
+                    f"{naturalness_note}{harness_note}"
                 )
 
             raw_turn_traces = getattr(
@@ -1170,6 +1251,8 @@ class SimulationEvals(Apps):
                 "name": name,
                 "run": run_idx + 1,
                 "passed": passed,
+                "outcome": outcome.value,
+                "harness_error": harness_error,
                 "goals": f"{goals_completed}/{total_goals}",
                 "expectations": f"{expectations_met}/{total_exp}",
                 "turns": conv.current_turn,
@@ -1247,6 +1330,12 @@ class SimulationEvals(Apps):
     ) -> str | None:
         if row.get("error"):
             return f"session died: {str(row['error'])[:80]}"
+        if is_harness_error(row):
+            err = row.get("harness_error") or {}
+            return (
+                "simulated user failed: "
+                f"{str(err.get('error_type', 'unknown'))[:80]}"
+            )
         name = row.get("name")
         if declared_by_name.get(name, 0) > 0 and str(
             row.get("expectations", "")
@@ -1487,12 +1576,19 @@ class SimulationEvals(Apps):
         if still and infra_retries > 0:
             print(
                 f"[infra] {len(still)} run(s) still inconclusive after "
-                f"{infra_retries} retries -- counted as FAIL:"
+                f"{infra_retries} retries -- harness errors are excluded "
+                "from the pass rate, other runs are counted as FAIL:"
             )
             for row, why in still:
                 print(
                     f"        - {row.get('name')} run {row.get('run')}: {why}"
                 )
+
+        summary = format_simulation_summary(
+            [r for r in results if isinstance(r, dict) and "name" in r]
+        )
+        if summary:
+            print("\n" + summary)
 
         return results
 

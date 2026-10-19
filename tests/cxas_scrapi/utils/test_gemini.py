@@ -260,3 +260,21 @@ def test_generate_async_zero_retries_returns_none(
     gen = GeminiGenerate(project_id="p", max_concurrent_requests=1)
     res = asyncio.run(gen.generate_async(prompt="x", max_retries=0))
     assert res is None
+
+
+@patch("cxas_scrapi.utils.gemini.genai")
+def test_generate_records_last_error_per_call(mock_genai: typing.Any) -> None:
+    fake_client = MagicMock()
+    mock_genai.Client.return_value = fake_client
+    fake_client.models.generate_content.side_effect = [
+        ValueError("400 INVALID_ARGUMENT"),
+        SimpleNamespace(text="ok"),
+    ]
+    gen = GeminiGenerate(project_id="p")
+
+    assert gen.last_error is None
+    assert gen.generate("hi") is None
+    assert isinstance(gen.last_error, ValueError)
+    # A later successful call clears the previous error.
+    assert gen.generate("hi") == "ok"
+    assert gen.last_error is None

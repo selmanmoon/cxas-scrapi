@@ -31,6 +31,7 @@ import yaml
 
 from cxas_scrapi.core import conversation_history, tools
 from cxas_scrapi.evals import runner as evals_runner
+from cxas_scrapi.evals import sim_reliability
 from cxas_scrapi.utils import (
     base_components,
     eval_utils,
@@ -1028,6 +1029,87 @@ def _inject_turn_latency_items(
     return out
 
 
+def _sim_run_status(r: dict[str, Any]) -> tuple[str, str]:
+    """Returns the CSS class and label for one simulation run."""
+    if sim_reliability.is_harness_error(r):
+        return "harness", "HARNESS ERROR"
+    if r.get("passed"):
+        return "pass", "PASS"
+    return "fail", "FAIL"
+
+
+def _render_harness_error(r: dict[str, Any]) -> str:
+    """Renders the harness-error explanation for a simulation run."""
+    err = r.get("harness_error")
+    if not isinstance(err, dict):
+        return ""
+    elapsed = (
+        f" after {err['elapsed_s']}s"
+        if err.get("elapsed_s") is not None
+        else ""
+    )
+    return (
+        '<div class="expectation harness-error">'
+        '<span class="badge harness">Harness error</span> '
+        f"The simulated user stopped at turn {_escape(err.get('turn', '?'))}"
+        f"{elapsed} &mdash; <code>{_escape(err.get('error_type', ''))}</code>: "
+        f"{_escape(err.get('message', ''))}<br>"
+        '<span class="meta">The simulator failed before the conversation '
+        "finished, so this run is inconclusive and excluded from the pass "
+        "rate.</span></div>\n"
+    )
+
+
+def _render_sim_reliability(sim_results: list[dict[str, Any]]) -> str:
+    """Renders the per-case pass^k table when any case ran more than once."""
+    rel = sim_reliability.reliability_summary(sim_results)
+    if rel["max_runs"] <= 1:
+        return ""
+    label_cls = {
+        "stable_pass": "pass",
+        "stable_fail": "fail",
+        "flaky": "warn",
+        "inconclusive": "harness",
+    }
+
+    def _yn(value: bool | None) -> str:
+        if value is None:
+            return "&ndash;"
+        return (
+            '<span class="pass">yes</span>'
+            if value
+            else ('<span class="fail">no</span>')
+        )
+
+    def _pct(value: float | None) -> str:
+        return "&ndash;" if value is None else f"{100 * value:.0f}%"
+
+    rows = ""
+    for c in sorted(
+        rel["per_case"],
+        key=lambda c: (c["pass_rate"] is None, c["pass_rate"] or 0, c["name"]),
+    ):
+        rows += (
+            f"  <tr><td>{_escape(c['name'])}</td>"
+            f"<td>{c['passes']}/{c['k']}</td>"
+            f"<td>{c['harness_errors'] or ''}</td>"
+            f"<td>{_yn(c['pass_hat_k'])}</td><td>{_yn(c['pass_at_k'])}</td>"
+            f'<td><span class="badge {label_cls[c["label"]]}">'
+            f"{c['label'].replace('_', ' ')}</span></td></tr>\n"
+        )
+    return (
+        '<h2 id="section-reliability">Reliability across runs '
+        f'<span class="meta">(pass^k {_pct(rel["pass_hat_k"])} &middot; '
+        f"pass@k {_pct(rel['pass_at_k'])} over "
+        f"{rel['conclusive_cases']} cases)</span></h2>\n"
+        '<p class="meta">pass^k: passed in every scored run. pass@k: passed '
+        "in at least one. Harness-error runs are excluded from k.</p>\n"
+        "<table>\n  <tr><th>Eval</th><th>Passed / k</th><th>Harness errors"
+        "</th><th>pass^k</th><th>pass@k</th><th>Stability</th></tr>\n"
+        f"{rows}</table>\n"
+    )
+
+
 def _get_summary_block(
     passed: typing.Any,
     total: typing.Any,
@@ -1037,11 +1119,22 @@ def _get_summary_block(
     ts: typing.Any,
     wall_clock_s: typing.Any,
     suite_pl: dict[str, Any] | None = None,
+    harness_errors: int = 0,
 ) -> str:
     """Return the HTML summary block."""
     pct = 100 * passed / total if total else 0
     pass_threshold = 90
     cls = "pass" if pct >= pass_threshold else "fail"
+    pct_str = f"{pct:.1f}%"
+    if not total and harness_errors:
+        # Every run was inconclusive, so there is no rate to show.
+        cls, pct_str = "harness", "n/a"
+    harness_str = (
+        f'<span class="harness">{harness_errors} harness errors '
+        "(inconclusive)</span> |"
+        if harness_errors
+        else ""
+    )
     pl_btn = (
         '<button id="btn-latency" onclick="toggleAllLatency()">'
         "⏱ Expand All Latency</button>"
@@ -1068,8 +1161,8 @@ def _get_summary_block(
 </h1>
 <div class="summary">
   <div class="summary-top">
-    <div class="big {cls}">{pct:.1f}%</div>
-    <div><b>{passed}/{total}</b> passed | {errors} errors |
+    <div class="big {cls}">{pct_str}</div>
+    <div><b>{passed}/{total}</b> passed | {errors} errors | {harness_str}
       {modality} | model: <code>{model}</code><br>
       <span class="meta">Generated {ts}
       {rt_str}</span>
@@ -1096,7 +1189,12 @@ def _get_results_table(eval_stats: typing.Any) -> typing.Any:
         safe_name = name.replace("'", "\\'")
         dots = ""
         for i, r in enumerate(s["runs"]):
-            dot_cls = "p" if r.get("passed") else ("e" if "error" in r else "f")
+            if sim_reliability.is_harness_error(r):
+                dot_cls = "h"
+            elif r.get("passed"):
+                dot_cls = "p"
+            else:
+                dot_cls = "e" if "error" in r else "f"
             dots += (
                 f'<span class="run-dot {dot_cls}" title="Run {r["run"]}" '
                 'onclick="event.stopPropagation(); '
@@ -1458,17 +1556,15 @@ def _get_run_detail(
 ) -> typing.Any:
     """Return the HTML for a single run detail."""
     html = ""
-    run_cls = "pass" if r.get("passed") else "fail"
-    failed_str = "false" if r.get("passed") else "true"
+    run_cls, run_label = _sim_run_status(r)
+    failed_str = "true" if run_cls == "fail" else "false"
     dur_str = (
         f" | {_fmt_duration(r['duration_s'])}" if r.get("duration_s") else ""
     )
     session_id = r.get("session_id", "")
     html += f'<details class="run-detail" data-failed="{failed_str}">\n'
     html += (
-        f"<summary>Run {r['run']} — "
-        f'<span class="{run_cls}">'
-        f"{'PASS' if r.get('passed') else 'FAIL'}</span>"
+        f'<summary>Run {r["run"]} — <span class="{run_cls}">{run_label}</span>'
     )
     naturalness = r.get("naturalness")
     naturalness_note = (
@@ -1494,6 +1590,7 @@ def _get_run_detail(
             f"{_escape(r['error'])}</div>\n"
         )
     else:
+        html += _render_harness_error(r)
         html += _render_step_details(r.get("step_details", []))
 
         html += _render_expectation_details(r.get("expectation_details", []))
@@ -1553,8 +1650,10 @@ def generate_html_report(
       wall_clock_s: Total elapsed execution time in seconds.
       user_agent_extension: Optional user agent extension string.
     """
-    total = len(results)
-    passed = sum(1 for r in results if r.get("passed"))
+    outcome_counts = sim_reliability.summarize_outcomes(results)
+    # Harness errors are inconclusive, so they leave the denominator.
+    total = outcome_counts["scored"]
+    passed = outcome_counts["passed"]
     errors = sum(1 for r in results if "error" in r)
 
     conv_analyses = _attach_perceived_latency(
@@ -1571,7 +1670,8 @@ def generate_html_report(
         n = r["name"]
         if n not in eval_stats:
             eval_stats[n] = {"pass": 0, "total": 0, "runs": []}
-        eval_stats[n]["total"] += 1
+        if not sim_reliability.is_harness_error(r):
+            eval_stats[n]["total"] += 1
         if r.get("passed"):
             eval_stats[n]["pass"] += 1
         eval_stats[n]["runs"].append(r)
@@ -1610,9 +1710,11 @@ def generate_html_report(
         ts,
         wall_clock_s,
         suite_pl=suite_pl,
+        harness_errors=outcome_counts["harness_errors"],
     )
 
     html += _get_results_table(eval_stats)
+    html += _render_sim_reliability(results)
     html += '\n<h2 id="section-sims">Eval Details</h2>\n'
 
     for name, s in sorted(
@@ -1699,10 +1801,11 @@ def generate_combined_html_report(
         if golden_results
         else 0
     )
-    s_total = len(sim_results) if sim_results else 0
-    s_passed = (
-        sum(1 for r in sim_results if r.get("passed")) if sim_results else 0
-    )
+    s_counts = sim_reliability.summarize_outcomes(sim_results or [])
+    # Harness errors are inconclusive: shown separately, never scored.
+    s_total = s_counts["scored"]
+    s_passed = s_counts["passed"]
+    s_harness = s_counts["harness_errors"]
     t_total = len(tool_results) if tool_results else 0
     t_passed = (
         sum(1 for r in tool_results if r.get("passed")) if tool_results else 0
@@ -1743,8 +1846,11 @@ def generate_combined_html_report(
         for r in sim_results:
             n = r["name"]
             if n not in sim_stats:
-                sim_stats[n] = {"pass": 0, "total": 0, "runs": []}
-            sim_stats[n]["total"] += 1
+                sim_stats[n] = {"pass": 0, "total": 0, "harness": 0, "runs": []}
+            if sim_reliability.is_harness_error(r):
+                sim_stats[n]["harness"] += 1
+            else:
+                sim_stats[n]["total"] += 1
             if r.get("passed"):
                 sim_stats[n]["pass"] += 1
             sim_stats[n]["runs"].append(r)
@@ -1762,15 +1868,29 @@ def generate_combined_html_report(
                 detail = (
                     f"naturalness {sum(nat_scores) / len(nat_scores):.1f}/5"
                 )
+            if s["total"] == 0:
+                sim_label = "INCONCLUSIVE"
+            elif s["pass"] == s["total"]:
+                sim_label = "PASSED"
+            elif s["pass"] == 0:
+                sim_label = "FAILED"
+            else:
+                sim_label = "MIXED"
+            if s["harness"]:
+                note = f"{s['harness']} harness error"
+                note += "s" if s["harness"] > 1 else ""
+                detail = f"{detail} | {note}" if detail else note
             unified.append(
                 {
                     "name": name,
                     "type": "sim",
-                    "passed": s["pass"] == s["total"],
+                    "passed": s["total"] > 0 and s["pass"] == s["total"],
                     "score": f"{s['pass']}/{s['total']}",
                     "detail": detail,
                     "runs": s["total"],
                     "run_results": s["runs"],
+                    "sim_label": sim_label,
+                    "harness_errors": s["harness"],
                 }
             )
 
@@ -1879,7 +1999,8 @@ def generate_combined_html_report(
     # Collect sim failures
     if sim_results:
         for r in sim_results:
-            if r.get("passed"):
+            # Harness errors are not agent failures; they get their own badge.
+            if r.get("passed") or sim_reliability.is_harness_error(r):
                 continue
             for step in r.get("step_details", []):
                 if step.get("status") != "Completed":
@@ -2121,6 +2242,10 @@ def generate_combined_html_report(
         g_duration=g_duration,
         s_passed=s_passed,
         s_total=s_total,
+        s_harness=s_harness,
+        sim_reliability_html=_render_sim_reliability(sim_results or []),
+        render_harness_error=_render_harness_error,
+        sim_run_status=_sim_run_status,
         s_dur=s_dur,
         t_passed=t_passed,
         t_total=t_total,
@@ -2215,14 +2340,25 @@ def generate_combined_json_report(
             "passed": sum(1 for r in results if r.get("passed")),
         }
 
+    sim_counts = sim_reliability.summarize_outcomes(sim_results)
+    sim_summary = {"total": sim_counts["total"], "passed": sim_counts["passed"]}
+    if sim_counts["harness_errors"]:
+        # Only added when present so existing consumers see the same shape.
+        sim_summary.update(
+            failed=sim_counts["failed"],
+            harness_errors=sim_counts["harness_errors"],
+            pass_rate_pct=sim_counts["pass_rate_pct"],
+        )
     per_type = {
         "golden": _counts(golden_results),
-        "simulation": _counts(sim_results),
+        "simulation": sim_summary,
         "tool": _counts(tool_results),
         "callback": _counts(callback_results),
     }
     total = sum(c["total"] for c in per_type.values())
     passed = sum(c["passed"] for c in per_type.values())
+    # Harness errors are inconclusive and do not count against the rate.
+    scored = total - sim_counts["harness_errors"]
 
     report = {
         "schema_version": 1,
@@ -2236,9 +2372,13 @@ def generate_combined_json_report(
         "summary": {
             "total": total,
             "passed": passed,
-            "pass_rate_pct": round(100 * passed / total, 2) if total else 0,
+            "harness_errors": sim_counts["harness_errors"],
+            "pass_rate_pct": round(100 * passed / scored, 2) if scored else 0,
             **per_type,
         },
+        "simulation_reliability": sim_reliability.reliability_summary(
+            sim_results
+        ),
         "results": {
             "golden": _sanitize_for_json(golden_results),
             "simulation": _sanitize_for_json(sim_results),
@@ -2945,6 +3085,11 @@ def generate_combined_report_from_dir(
             print(
                 f"Loaded {len(sim_results)} sim results from {latest_sim_file}"
             )
+            sim_summary = sim_reliability.format_simulation_summary(
+                [r for r in sim_results if isinstance(r, dict) and "name" in r]
+            )
+            if sim_summary:
+                print(sim_summary)
 
         if tool_files:
             tool_files.sort(key=os.path.getmtime)
