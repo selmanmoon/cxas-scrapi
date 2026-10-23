@@ -49,6 +49,14 @@ COMBINED_REPORT_FILENAME = "combined_report.html"
 COMBINED_REPORT_JSON_FILENAME = "combined_report.json"
 TIMESTAMP_PATTERN = r"\d{8}_\d{6}"
 
+# Non-terminal EvaluationRunState values: 0=UNSPECIFIED, 1=RUNNING.
+_PENDING_RUN_STATES = {0, 1}
+_PENDING_RUN_STATE_NAMES = {
+    "UNSPECIFIED",
+    "EVALUATION_RUN_STATE_UNSPECIFIED",
+    "RUNNING",
+}
+
 logger = logging.getLogger(__name__)
 
 
@@ -1395,7 +1403,31 @@ class EvalUtils(Evaluations):
         start_time = time.time()
         while True:
             run_status = self.eval_client.get_evaluation_run(run_name)
-            if run_status.state.name in ["COMPLETED", "ERROR"]:
+            state = run_status.state
+            state_name = getattr(state, "name", None)
+            if not isinstance(state_name, str):
+                state_name = None
+            if isinstance(state, int):
+                state_int: int | None = int(state)
+            elif isinstance(getattr(state, "value", None), int):
+                state_int = int(state.value)
+            else:
+                state_int = None
+
+            if state_int is not None:
+                is_pending = state_int in _PENDING_RUN_STATES
+            elif state_name is not None:
+                is_pending = state_name in _PENDING_RUN_STATE_NAMES
+            else:
+                is_pending = int(state) in _PENDING_RUN_STATES
+
+            if not is_pending:
+                if state_int == 3 or state_name == "ERROR":
+                    logger.warning(
+                        "Evaluation run %s finished with error state: %s",
+                        run_name,
+                        state_name or state_int,
+                    )
                 break
             if time.time() - start_time > timeout_seconds:
                 raise TimeoutError(f"Evaluation run {run_name} timed out.")
